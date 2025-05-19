@@ -22,366 +22,399 @@ import copy
 
 import wandb
 
+from adam_atan2_pytorch import AdamAtan2
+
 torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
+torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
 
 
 def train_step(model, xs, ys, optimizer, loss_func, start_idx = 0, precision='full'):
-	optimizer.zero_grad()
-	output = model(xs, ys)
+    optimizer.zero_grad()
+    output = model(xs, ys)
 
-	if precision == 'half':
-		ys = ys.to(torch.float16)
+    if precision == 'half':
+        ys = ys.to(torch.float16)
 
-	loss = loss_func(output[:, start_idx:], ys[:, start_idx:])
-	loss.backward()
-	optimizer.step()
-	return loss.detach().item(), output.detach()
+    loss = loss_func(output[:, start_idx:], ys[:, start_idx:])
+    loss.backward()
+    optimizer.step()
+    return loss.detach().item(), output.detach()
 
 def sample_seeds(total_seeds, count):
-	seeds = set()
-	while len(seeds) < count:
-		seeds.add(randint(0, total_seeds - 1))
-	return seeds
+    seeds = set()
+    while len(seeds) < count:
+        seeds.add(randint(0, total_seeds - 1))
+    return seeds
 
+import inspect
+def configure_optimizers(model, use_adam_atan2, learning_rate, weight_decay=0.1, betas=(0.9, 0.95), device_type='cuda'):
+    # start with all of the candidate parameters
+    param_dict = {pn: p for pn, p in model.named_parameters()}
+    # filter out those that do not require grad
+    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+    # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+    # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    optim_groups = [
+        {'params': decay_params, 'weight_decay': weight_decay},
+        {'params': nodecay_params, 'weight_decay': 0.0}
+    ]
+    num_decay_params = sum(p.numel() for p in decay_params)
+    num_nodecay_params = sum(p.numel() for p in nodecay_params)
+    print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+    print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+
+    if use_adam_atan2:
+        # decoupled_wd does not work
+        optimizer = AdamAtan2(optim_groups, lr=args.learning_rate, betas=betas)
+    else:
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+
+    return optimizer
 
 def train(model, args):
-	if args.precision == 'half':
-		optimizer = torch.optim.Adam(model.parameters(), eps=1e-4, lr=args.learning_rate)
-	else:
-		optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-	curriculum = Curriculum(args)
-	task = args.task
-	device = model.device
+    optimizer = configure_optimizers(model, use_adam_atan2=args.adam_atan2, learning_rate=args.learning_rate)
 
-	init_model = copy.deepcopy(model)
+    curriculum = Curriculum(args)
+    task = args.task
+    device = model.device
 
-	starting_step = 0
-	state_path = os.path.join(args.out_dir, "state.pt")
-	if os.path.exists(state_path):
-		state = torch.load(state_path)
-		model.load_state_dict(state["model_state_dict"])
-		optimizer.load_state_dict(state["optimizer_state_dict"])
-		starting_step = state["train_step"]
-		for i in range(state["train_step"] + 1):
-			curriculum.update()
+    init_model = copy.deepcopy(model)
 
-	n_dims = model.n_dims
-	bsize = args.batch_size
+    starting_step = 0
+    state_path = os.path.join(args.out_dir, "state.pt")
+    if os.path.exists(state_path):
+        state = torch.load(state_path)
+        model.load_state_dict(state["model_state_dict"])
+        optimizer.load_state_dict(state["optimizer_state_dict"])
+        starting_step = state["train_step"]
+        for i in range(state["train_step"] + 1):
+            curriculum.update()
 
-	start_idx=0
-	if "start_idx" in args.task_kwargs and args.task == "nearest_neighbours":
-		start_idx = args.task_kwargs["start_idx"]
+    n_dims = model.n_dims
+    bsize = args.batch_size
 
-	if 'bool' not in args.data:
-		task_sampler = tasks.get_task_sampler(
-			args.task,
-			n_dims,
-			bsize,
-			num_tasks=args.num_tasks,
-			**args.task_kwargs,
-		)
-	else:
-		task_sampler = get_task_sampler(
-		args.task,
-		n_dims,
-		bsize,
-		n_points = curriculum.n_points,
-		num_tasks=args.num_tasks,
-		**args.task_kwargs,
-	)
+    start_idx=0
+    if "start_idx" in args.task_kwargs and args.task == "nearest_neighbours":
+        start_idx = args.task_kwargs["start_idx"]
 
-	if 'bool' not in args.data:
-		data_sampler = get_data_sampler(args.data, n_dims=n_dims)
+    if 'bool' not in args.data:
+        task_sampler = tasks.get_task_sampler(
+            args.task,
+            n_dims,
+            bsize,
+            num_tasks=args.num_tasks,
+            **args.task_kwargs,
+        )
+    else:
+        task_sampler = get_task_sampler(
+        args.task,
+        n_dims,
+        bsize,
+        n_points = curriculum.n_points,
+        num_tasks=args.num_tasks,
+        **args.task_kwargs,
+    )
 
-	pbar = tqdm(range(starting_step, args.train_steps))
+    if 'bool' not in args.data:
+        data_sampler = get_data_sampler(args.data, n_dims=n_dims)
 
-	num_training_examples = args.num_training_examples
+    pbar = tqdm(range(starting_step, args.train_steps))
 
-	for i in pbar:
-		data_sampler_args = {}
-		task_sampler_args = {}
+    num_training_examples = args.num_training_examples
+
+    for i in pbar:
+        data_sampler_args = {}
+        task_sampler_args = {}
 
 
-		if num_training_examples != 0:
-			assert num_training_examples >= bsize
-			seeds = sample_seeds(num_training_examples, bsize)
-			data_sampler_args["seeds"] = seeds
-			task_sampler_args["seeds"] = [s + 1 for s in seeds]
+        if num_training_examples != 0:
+            assert num_training_examples >= bsize
+            seeds = sample_seeds(num_training_examples, bsize)
+            data_sampler_args["seeds"] = seeds
+            task_sampler_args["seeds"] = [s + 1 for s in seeds]
 
-		task = task_sampler(**task_sampler_args)
-		if 'bool' not in args.data:
-			xs = data_sampler.sample_xs(
-				curriculum.n_points,
-				bsize,
-				curriculum.n_dims_truncated,
-				**data_sampler_args,
-			)
-		else:
-			xs = task.sample_xs(
-				curriculum.n_points,
-				bsize,
-			)
-		
-		ys = task.evaluate(xs)
-		
-		if args.noise_rate > 0:
-			n_points = curriculum.n_points
-			ns = args.noise_rate
-			noise_mat = torch.tensor(np.random.choice([1, -1], size=(bsize, n_points), p=[1-ns, ns]), dtype=torch.float)
-			ys = ys * noise_mat
-		
+        task = task_sampler(**task_sampler_args)
+        if 'bool' not in args.data:
+            xs = data_sampler.sample_xs(
+                curriculum.n_points,
+                bsize,
+                curriculum.n_dims_truncated,
+                **data_sampler_args,
+            )
+        else:
+            xs = task.sample_xs(
+                curriculum.n_points,
+                bsize,
+            )
 
-		loss_func = task.get_training_metric()
+        ys = task.evaluate(xs)
 
-		loss, output = train_step(model, xs.to(device), ys.to(device), optimizer, loss_func, start_idx, precision=args.precision)
+        if args.noise_rate > 0:
+            n_points = curriculum.n_points
+            ns = args.noise_rate
+            noise_mat = torch.tensor(np.random.choice([1, -1], size=(bsize, n_points), p=[1-ns, ns]), dtype=torch.float)
+            ys = ys * noise_mat
 
-		if args.prefix_score_train:
-			if i%args.prefix_score_train_interval == 0:
-				task = task_sampler()
-				if 'bool' not in args.data:
-					xs_prefix = data_sampler.sample_xs(
-						args.prefix_score_n_points,
-						bsize,
-						curriculum.n_dims_truncated,
-						**data_sampler_args,
-					)
-				else:
-					xs_prefix = task.sample_xs(
-						args.prefix_score_n_points,
-						bsize,
-					) # bs x n_points x n_dims
 
-				ls_xs = [xs_prefix for rep in range(args.prefix_score_n_repeats)]
+        loss_func = task.get_training_metric()
 
-				xs_prefix = torch.cat(ls_xs, dim=1)
-				
-				ys_prefix = task.evaluate(xs_prefix)
+        loss, output = train_step(model, xs.to(device), ys.to(device), optimizer, loss_func, start_idx, precision=args.precision)
 
-				xs_prefix = xs_prefix[:args.prefix_score_bsize]
-				ys_prefix = ys_prefix[:args.prefix_score_bsize]
+        if args.prefix_score_train:
+            if i%args.prefix_score_train_interval == 0:
+                task = task_sampler()
+                if 'bool' not in args.data:
+                    xs_prefix = data_sampler.sample_xs(
+                        args.prefix_score_n_points,
+                        bsize,
+                        curriculum.n_dims_truncated,
+                        **data_sampler_args,
+                    )
+                else:
+                    xs_prefix = task.sample_xs(
+                        args.prefix_score_n_points,
+                        bsize,
+                    ) # bs x n_points x n_dims
 
-				prefix_score, num_induc_heads, prefix_head_scores = prefix_scoring_step(model, xs_prefix.to(device), ys_prefix.to(device), num_repeats=args.prefix_score_n_repeats)
-		else:
-			prefix_score, num_induc_heads, prefix_head_scores = 0, 0, {"not_run": 0}
+                ls_xs = [xs_prefix for rep in range(args.prefix_score_n_repeats)]
 
-		if args.nn_score_train:
-			if i%args.nn_score_train_interval == 0:
-				task = task_sampler()
-				if 'bool' not in args.data:
-					xs_nn = data_sampler.sample_xs(
-						args.nn_score_n_points,
-						bsize,
-						curriculum.n_dims_truncated,
-						**data_sampler_args,
-					)
-				else:
-					xs_nn = task.sample_xs(
-						args.nn_score_n_points,
-						bsize,
-					) # bs x n_points x n_dims
-				
-				ys_nn = task.evaluate(xs_nn)
+                xs_prefix = torch.cat(ls_xs, dim=1)
 
-				xs_nn = xs_nn[:args.nn_score_bsize]
-				ys_nn = ys_nn[:args.nn_score_bsize]
+                ys_prefix = task.evaluate(xs_prefix)
 
-				nn_score, num_nn_heads, nn_head_scores = nn_scoring_step(model, xs_nn.to(device), ys_nn.to(device), start_point=args.nn_score_start_point, num_neighbours=args.nn_score_num_neighbours, device=device)
-		else:
-			nn_score, num_nn_heads, nn_head_scores = 0, 0, {"not_run": 0}
+                xs_prefix = xs_prefix[:args.prefix_score_bsize]
+                ys_prefix = ys_prefix[:args.prefix_score_bsize]
 
-		point_wise_tags = list(range(curriculum.n_points))
-		point_wise_loss_func = task.get_metric()
-		point_wise_loss = point_wise_loss_func(output, ys.to(device)).mean(dim=0)
-		mean_acc = point_wise_loss.mean().item()
-		null_pred = torch.zeros_like(ys) - 1
-		null_acc = point_wise_loss_func(null_pred, ys).mean().item()
+                prefix_score, num_induc_heads, prefix_head_scores = prefix_scoring_step(model, xs_prefix.to(device), ys_prefix.to(device), num_repeats=args.prefix_score_n_repeats)
+        else:
+            prefix_score, num_induc_heads, prefix_head_scores = 0, 0, {"not_run": 0}
 
-		baseline_loss = (
-			sum(
-				max(curriculum.n_dims_truncated - ii, 0)
-				for ii in range(curriculum.n_points)
-			)
-			/ curriculum.n_points
-		)
-		
-		
-		if args.wandb:
-			if i % args.log_every_steps == 0 and not args.test_run:
-				init_distance = model_dist(curr_model= model, init_model= init_model, weight_only=True)
-				wandb.log(
-					{
-						"mean_acc": mean_acc,
-						"null_acc": null_acc,
-						"overall_loss": loss,
-						"init_distance": init_distance,
-						# "misc/excess_loss": loss / baseline_loss,                        
-						"pointwise/loss": dict(
-							zip(point_wise_tags, point_wise_loss.cpu().numpy())
-						),
-						"misc/n_points": curriculum.n_points,
-						"misc/n_dims": curriculum.n_dims_truncated
-					},
-					step=i,
-				)
-				if args.analyze:
-					grad_vals = []
+        if args.nn_score_train:
+            if i%args.nn_score_train_interval == 0:
+                task = task_sampler()
+                if 'bool' not in args.data:
+                    xs_nn = data_sampler.sample_xs(
+                        args.nn_score_n_points,
+                        bsize,
+                        curriculum.n_dims_truncated,
+                        **data_sampler_args,
+                    )
+                else:
+                    xs_nn = task.sample_xs(
+                        args.nn_score_n_points,
+                        bsize,
+                    ) # bs x n_points x n_dims
 
-					for name, param in model.named_parameters():
-						if param.requires_grad and param.grad is not None:
-							grad_val = param.grad.norm().item()
-							grad_vals.append(grad_val)
-							wandb.log(
-								{
-									f"grads/{name}": grad_val,
-								},
-								step=i,
-							)
-					wandb.log(
-						{
-							"misc/mean": np.mean(grad_vals),							
-							"misc/max": np.max(grad_vals),
-							"misc/min": np.min(grad_vals),
-							"misc/std": np.std(grad_vals),
-						},
-						step=i,
-					)
-			if args.nn_score_train and i%args.nn_score_train_interval == 0:
-				wandb.log(
-					{
-						"nn_score": nn_score,
-						"num_nn_heads": num_nn_heads,
-						"nn_scores/score": nn_head_scores
-					},
-					step=i,
-				)
-			if args.prefix_score_train and i%args.prefix_score_train_interval == 0:
-				wandb.log(
-					{
-						"prefix_score": prefix_score,
-						"num_induction_heads": num_induc_heads,
-						"prefix_scores/score": prefix_head_scores
-					},
-					step=i,
-				)
+                ys_nn = task.evaluate(xs_nn)
 
-		curriculum.update()
+                xs_nn = xs_nn[:args.nn_score_bsize]
+                ys_nn = ys_nn[:args.nn_score_bsize]
 
-		pbar.set_description(f"loss {loss}")
-		if i % args.save_every_steps == 0 and not args.test_run:
-			training_state = {
-				"model_state_dict": model.state_dict(),
-				"optimizer_state_dict": optimizer.state_dict(),
-				"train_step": i,
-			}
-			torch.save(training_state, state_path)
+                nn_score, num_nn_heads, nn_head_scores = nn_scoring_step(model, xs_nn.to(device), ys_nn.to(device), start_point=args.nn_score_start_point, num_neighbours=args.nn_score_num_neighbours, device=device)
+        else:
+            nn_score, num_nn_heads, nn_head_scores = 0, 0, {"not_run": 0}
 
-			if mean_acc > 0.9999 and args.task not in ['linear_regression', 'sparse_linear_regression', 'relu_2nn_regression', 'decision_tree']:
-				break 
+        point_wise_tags = list(range(curriculum.n_points))
+        point_wise_loss_func = task.get_metric()
+        point_wise_loss = point_wise_loss_func(output, ys.to(device)).mean(dim=0)
+        mean_acc = point_wise_loss.mean().item()
+        null_pred = torch.zeros_like(ys) - 1
+        null_acc = point_wise_loss_func(null_pred, ys).mean().item()
 
-		if (
-			args.keep_every_steps > 0
-			and i % args.keep_every_steps == 0
-			and not args.test_run
-			and i > 0
-		):
-			torch.save(model.state_dict(), os.path.join(args.out_dir, f"model_{i}.pt"))
+        baseline_loss = (
+            sum(
+                max(curriculum.n_dims_truncated - ii, 0)
+                for ii in range(curriculum.n_points)
+            )
+            / curriculum.n_points
+        )
+
+
+        if args.wandb:
+            if i % args.log_every_steps == 0 and not args.test_run:
+                init_distance = model_dist(curr_model= model, init_model= init_model, weight_only=True)
+                wandb.log(
+                    {
+                        "mean_acc": mean_acc,
+                        "null_acc": null_acc,
+                        "overall_loss": loss,
+                        "init_distance": init_distance,
+                        # "misc/excess_loss": loss / baseline_loss,
+                        "pointwise/loss": dict(
+                            zip(point_wise_tags, point_wise_loss.cpu().numpy())
+                        ),
+                        "misc/n_points": curriculum.n_points,
+                        "misc/n_dims": curriculum.n_dims_truncated
+                    },
+                    step=i,
+                )
+                if args.analyze:
+                    grad_vals = []
+
+                    for name, param in model.named_parameters():
+                        if param.requires_grad and param.grad is not None:
+                            grad_val = param.grad.norm().item()
+                            grad_vals.append(grad_val)
+                            wandb.log(
+                                {
+                                    f"grads/{name}": grad_val,
+                                },
+                                step=i,
+                            )
+                    wandb.log(
+                        {
+                            "misc/mean": np.mean(grad_vals),
+                            "misc/max": np.max(grad_vals),
+                            "misc/min": np.min(grad_vals),
+                            "misc/std": np.std(grad_vals),
+                        },
+                        step=i,
+                    )
+            if args.nn_score_train and i%args.nn_score_train_interval == 0:
+                wandb.log(
+                    {
+                        "nn_score": nn_score,
+                        "num_nn_heads": num_nn_heads,
+                        "nn_scores/score": nn_head_scores
+                    },
+                    step=i,
+                )
+            if args.prefix_score_train and i%args.prefix_score_train_interval == 0:
+                wandb.log(
+                    {
+                        "prefix_score": prefix_score,
+                        "num_induction_heads": num_induc_heads,
+                        "prefix_scores/score": prefix_head_scores
+                    },
+                    step=i,
+                )
+
+        curriculum.update()
+
+        pbar.set_description(f"loss {loss}")
+        if i % args.save_every_steps == 0 and not args.test_run:
+            training_state = {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "train_step": i,
+            }
+            torch.save(training_state, state_path)
+
+            if mean_acc > 0.9999 and args.task not in ['linear_regression', 'sparse_linear_regression', 'relu_2nn_regression', 'decision_tree']:
+                break
+
+        if (
+            args.keep_every_steps > 0
+            and i % args.keep_every_steps == 0
+            and not args.test_run
+            and i > 0
+        ):
+            torch.save(model.state_dict(), os.path.join(args.out_dir, f"model_{i}.pt"))
 
 
 def main(args):
-	if args.test_run:
-		args.curriculum_points_start = args.curriculum_points_end
-		args.curriculum_dims_start = args.curriculum_dims_end
-		args.train_steps = 100
-	else:
-		
-		args.curriculum_dims_end = args.n_dims
-		args.curriculum_dims_start = args.curriculum_dims_end
-		if args.wandb:
+    if args.test_run:
+        args.curriculum_points_start = args.curriculum_points_end
+        args.curriculum_dims_start = args.curriculum_dims_end
+        args.train_steps = 100
+    else:
 
-			wandb.init(
-				dir=args.out_dir,
-				project=args.project,
-				group = str(args.task),
-				entity=args.entity,
-				config=args.__dict__,
-				notes=args.notes,
-				name=args.name,                
-				resume=True,
-			)
+        args.curriculum_dims_end = args.n_dims
+        args.curriculum_dims_start = args.curriculum_dims_end
+        if args.wandb:
 
-	
+            wandb.init(
+                dir=args.out_dir,
+                project=args.project,
+                group = str(args.task),
+                entity=args.entity,
+                config=args.__dict__,
+                notes=args.notes,
+                name=args.name,
+                resume=True,
+            )
 
-	device = torch.device("cuda:{}".format(args.gpu))
 
-	model = build_model(args)
-	model.to(device)
-	model.device = device
-	model.train()
 
-	train(model, args)
+    device = torch.device("cuda:{}".format(args.gpu))
 
-	if not args.test_run:
-		eval_metrics = get_run_metrics(args.out_dir, device=device)  # precompute metrics for eval
-	
-	if args.wandb:
-		eval_metrics = eval_metrics['standard']
-		eval_models = list(eval_metrics.keys())
-		plot_y = []
+    model = build_model(args)
+    model.to(device)
+    model.device = device
+    model.train()
 
-		val_acc = eval_metrics[model.name]['mean']
-		mean_val_acc = np.mean(val_acc)
+    train(model, args)
 
-		wandb.log(
-					{
-						"mean_val_acc": mean_val_acc,
-					},
-				)
+    if not args.test_run:
+        eval_metrics = get_run_metrics(args.out_dir, device=device)  # precompute metrics for eval
 
-		for model_name in eval_models:
-			plot_y.append(eval_metrics[model_name]['mean'])
-		plot_x = list(range(len(plot_y[0])))
+    if args.wandb:
+        eval_metrics = eval_metrics['standard']
+        eval_models = list(eval_metrics.keys())
+        plot_y = []
 
-		wandb.log({'eval/mean_acc': wandb.plot.line_series(
-										plot_x, 
-										plot_y, 
-										keys=eval_models,
-										title='Accuracy of Different Models',
-										xname='Incontext Examples',                                
-										)})
-	
-	if args.delete:
-		print('Deleting model (pt) files...')
-		delete_pt_files(args.out_dir)
+        val_acc = eval_metrics[model.name]['mean']
+        mean_val_acc = np.mean(val_acc)
 
-	
+        wandb.log(
+                    {
+                        "mean_val_acc": mean_val_acc,
+                    },
+                )
+
+        for model_name in eval_models:
+            plot_y.append(eval_metrics[model_name]['mean'])
+        plot_x = list(range(len(plot_y[0])))
+
+        wandb.log({'eval/mean_acc': wandb.plot.line_series(
+                                        plot_x,
+                                        plot_y,
+                                        keys=eval_models,
+                                        title='Accuracy of Different Models',
+                                        xname='Incontext Examples',
+                                        )})
+
+    if args.delete:
+        print('Deleting model (pt) files...')
+        delete_pt_files(args.out_dir)
+
+
 
 
 if __name__ == "__main__":
-	parser = build_parser()
-	args = parser.parse_args()
-	
-	print(f"Running with: {args}")
+    parser = build_parser()
+    args = parser.parse_args()
 
-	if not args.test_run:
-		run_id = args.resume_id
-		if run_id == "":
-			run_id = str(uuid.uuid4())[:20]
-			print(f"Run ID: {run_id}")
-			
-			args.name += '_' + args.family
-			if args.family in ['gpt', 'mysan', 'attclf']:
-				args.name += '_' + args.model_name
-			args.name += '_' + run_id[:8]
+    print(f"Running with: {args}")
 
-		args.out_dir = os.path.join(args.out_dir, args.task)
-		out_dir = args.out_dir + '_' + args.family
-		out_dir = os.path.join(args.out_dir, args.name)
-		if not os.path.exists(out_dir):
-			os.makedirs(out_dir)
-		args.out_dir = out_dir
+    if not args.test_run:
+        run_id = args.resume_id
+        if run_id == "":
+            run_id = str(uuid.uuid4())[:20]
+            print(f"Run ID: {run_id}")
+
+            args.name += '_' + args.family
+            if args.family in ['gpt', 'mysan', 'attclf']:
+                args.name += '_' + args.model_name
+            args.name += '_' + run_id[:8]
+
+        args.out_dir = os.path.join(args.out_dir, args.task)
+        out_dir = args.out_dir + '_' + args.family
+        out_dir = os.path.join(args.out_dir, args.name)
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+        args.out_dir = out_dir
 
 
-		with open(os.path.join(out_dir, "config.yaml"), "w") as yaml_file:
-			yaml.dump(args.__dict__, yaml_file, default_flow_style=False)
+        with open(os.path.join(out_dir, "config.yaml"), "w") as yaml_file:
+            yaml.dump(args.__dict__, yaml_file, default_flow_style=False)
 
-	main(args)
+    main(args)

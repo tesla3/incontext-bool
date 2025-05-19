@@ -2,6 +2,10 @@
 .jj/
 *.pt
 *.ckpt
+*.bak.*
+.zed/
+models/
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

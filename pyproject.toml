@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "adam-atan2-pytorch>=0.1.18",
     "einops>=0.8.1",
     "ipdb>=0.13.13",
     "munch>=4.0.0",
