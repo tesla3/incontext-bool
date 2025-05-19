@@ -1,0 +1,21 @@
+[project]
+name = "incontext-bool"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "einops>=0.8.1",
+    "ipdb>=0.13.13",
+    "munch>=4.0.0",
+    "numpy>=2.2.6",
+    "opt-einsum>=3.4.0",
+    "pandas>=2.2.3",
+    "pyyaml>=6.0.2",
+    "scikit-learn>=1.6.1",
+    "torch==2.6",
+    "tqdm>=4.67.1",
+    "transformers>=4.51.3",
+    "wandb>=0.19.11",
+    "xgboost>=3.0.1",
+]
