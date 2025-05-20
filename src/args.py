@@ -1,5 +1,6 @@
 import argparse
 import json
+from email.policy import default
 
 TASK_LIST = [
     "linear_regression",
@@ -98,6 +99,10 @@ def build_parser():
     parser.add_argument('-batch_size', type=int, default=32, help='Batch size')
     parser.add_argument('-learning_rate', type=float,
                         default=0.0001, help='Learning rate')
+    parser.add_argument('-weight_decay', type=float,
+                        default=0.1, help='weight decay')
+    parser.add_argument('-cautious_factor', type=float,
+                        default=1.0, help='weight decay')
     parser.add_argument('-train_steps', type=int,
                         default=20001, help='number of train steps')
     parser.add_argument('-save_every_steps', type=int,
@@ -111,9 +116,8 @@ def build_parser():
                         action='store_false', help='Do not  analyze')
     parser.set_defaults(analyze=False)
 
-    parser.add_argument('-adam_atan2', dest='adam_atan2',
-                        action='store_true', help='use Adam atan2 optimizier instead of AdamW')
-    parser.set_defaults(adam_atan2=False)
+    parser.add_argument('-optimizer', type=str, dest='optimizer', default='adam_atan2',
+                         help='use AdamW, Adam_atan2, or Adopt_atan2 optimizier')
 
     # Curriculum
     parser.add_argument('-curriculum_dims_start', type=int,

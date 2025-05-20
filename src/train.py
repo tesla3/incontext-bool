@@ -22,7 +22,7 @@ import copy
 
 import wandb
 
-from adam_atan2_pytorch import AdamAtan2
+from adam_atan2_pytorch import AdamAtan2, AdoptAtan2
 
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
@@ -48,7 +48,7 @@ def sample_seeds(total_seeds, count):
     return seeds
 
 import inspect
-def configure_optimizers(model, use_adam_atan2, learning_rate, weight_decay=0.1, betas=(0.9, 0.95), device_type='cuda'):
+def configure_optimizers(model, optimizer, learning_rate, weight_decay=0.1, betas=(0.9, 0.95), device_type='cuda'):
     # start with all of the candidate parameters
     param_dict = {pn: p for pn, p in model.named_parameters()}
     # filter out those that do not require grad
@@ -66,21 +66,27 @@ def configure_optimizers(model, use_adam_atan2, learning_rate, weight_decay=0.1,
     print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
     print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
 
-    if use_adam_atan2:
+    if optimizer == 'adopt_atan2':
+        # adopt is insensitive to beta2
+        #optimizer = AdoptAtan2(optim_groups, lr=args.learning_rate, betas=(betas[0], 0.999))
+        optimizer = AdoptAtan2(model.parameters(), weight_decay=weight_decay, lr=args.learning_rate, betas=(betas[0], 0.999))
+    elif optimizer == 'adam_atan2':
         # decoupled_wd does not work
         optimizer = AdamAtan2(optim_groups, lr=args.learning_rate, betas=betas)
-    else:
+    elif optimizer == 'adamw':
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
         print(f"using fused AdamW: {use_fused}")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+    else:
+        raise ValueError(f"Unknown optimizer {optimizer}")
 
     return optimizer
 
 def train(model, args):
-    optimizer = configure_optimizers(model, use_adam_atan2=args.adam_atan2, learning_rate=args.learning_rate)
+    optimizer = configure_optimizers(model, optimizer=args.optimizer, learning_rate=args.learning_rate, weight_decay=args.weight_decay)
 
     curriculum = Curriculum(args)
     task = args.task
