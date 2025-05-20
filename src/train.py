@@ -48,7 +48,7 @@ def sample_seeds(total_seeds, count):
     return seeds
 
 import inspect
-def configure_optimizers(model, optimizer, learning_rate, weight_decay=0.1, betas=(0.9, 0.95), device_type='cuda'):
+def configure_optimizers(model, optimizer, learning_rate, weight_decay=0.1, betas=(0.9, 0.95), decoupled_wd=False, device_type='cuda'):
     # start with all of the candidate parameters
     param_dict = {pn: p for pn, p in model.named_parameters()}
     # filter out those that do not require grad
@@ -72,7 +72,7 @@ def configure_optimizers(model, optimizer, learning_rate, weight_decay=0.1, beta
         optimizer = AdoptAtan2(model.parameters(), weight_decay=weight_decay, lr=args.learning_rate, betas=(betas[0], 0.999))
     elif optimizer == 'adam_atan2':
         # decoupled_wd does not work
-        optimizer = AdamAtan2(optim_groups, lr=args.learning_rate, betas=betas)
+        optimizer = AdamAtan2(optim_groups, lr=args.learning_rate, betas=betas, decoupled_wd=decoupled_wd)
     elif optimizer == 'adamw':
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
@@ -86,7 +86,7 @@ def configure_optimizers(model, optimizer, learning_rate, weight_decay=0.1, beta
     return optimizer
 
 def train(model, args):
-    optimizer = configure_optimizers(model, optimizer=args.optimizer, learning_rate=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer = configure_optimizers(model, optimizer=args.optimizer, learning_rate=args.learning_rate, weight_decay=args.weight_decay, decoupled_wd=args.decoupled_wd)
 
     curriculum = Curriculum(args)
     task = args.task

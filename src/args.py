@@ -101,6 +101,9 @@ def build_parser():
                         default=0.0001, help='Learning rate')
     parser.add_argument('-weight_decay', type=float,
                         default=0.1, help='weight decay')
+    parser.add_argument('-decoupled_wd', dest='decoupled_wd',
+                        action='store_true', help='decouple weight decay, only applicable to adam_atan2')
+    parser.set_defaults(decoupled_wd=False)
     parser.add_argument('-cautious_factor', type=float,
                         default=1.0, help='weight decay')
     parser.add_argument('-train_steps', type=int,

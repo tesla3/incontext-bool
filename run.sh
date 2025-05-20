@@ -14,6 +14,12 @@ python -m src.train -project in-context-learning -name test -family san -model_n
 -gpu 2 \
 -optimizer=adam_atan2 -learning_rate 0.001  
 c
+#<<\c
+#testing decoupled_wd (does not converge)
+python -m src.train -project in-context-learning -name test -family san -model_name gpt2 -task conjunction -data boolean -train_steps 15000 -n_dims 28 -n_embd 256 -n_layer 12 -n_head 8 -batch_size 64 \
+-gpu 3 \
+-optimizer=adam_atan2 -learning_rate 0.001 -weight_decay 0.001 -decoupled_wd
+#c
 
 <<\c
 #testing lower weight decay to see if speeds up convergence (it seems converges slower than 0.1)
